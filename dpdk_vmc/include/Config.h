@@ -219,6 +219,12 @@ struct port_vlan_config
 #define TARGET_GBPS 3.6
 #endif
 
+// Per-cross-flow target rate. Only applied to Port 0 cross VMCs
+// (J1>J2, J2>J1, J3>J4, J4>J3). Loopback flows use TARGET_GBPS/NUM_TX_CORES.
+#ifndef CROSS_TARGET_GBPS
+#define CROSS_TARGET_GBPS 0.023
+#endif
+
 #ifndef RATE_LIMITER_ENABLED
 #define RATE_LIMITER_ENABLED 1
 #endif

@@ -178,6 +178,17 @@ struct tx_worker_params
 
     // Phase distribution: total active port count (runtime)
     uint16_t nb_ports;
+
+    // Dual-lane pacing (VMC mode): when a queue hosts both a normal loopback
+    // flow and a cross overlay flow, each lane gets its own rate. Either lane
+    // may have count=0 (unused). If both are 0, tx_worker falls back to the
+    // legacy single-lane round-robin driven by `limiter`.
+    uint16_t loopback_vl_start;
+    uint16_t loopback_vl_count;
+    double   loopback_gbps;
+    uint16_t cross_vl_start;
+    uint16_t cross_vl_count;
+    double   cross_gbps;
 };
 
 /**

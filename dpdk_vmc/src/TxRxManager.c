@@ -1237,6 +1237,26 @@ int tx_worker(void *arg)
     uint64_t next_send_time = rte_get_tsc_cycles() + stagger_offset;
 #endif
 
+    // Dual-lane pacing (VMC shared queues): independent next_send_time per lane.
+    const bool dual_lane = (params->loopback_vl_count > 0 || params->cross_vl_count > 0);
+    uint64_t lb_delay_cycles = 0, cr_delay_cycles = 0;
+    uint64_t lb_next_send = 0, cr_next_send = 0;
+    uint16_t lb_offset = 0, cr_offset = 0;
+    if (dual_lane) {
+        if (params->loopback_vl_count > 0 && params->loopback_gbps > 0.0) {
+            uint64_t lb_pps = (uint64_t)(params->loopback_gbps * 1e9 / 8.0 /
+                                         (double)PACKET_SIZE);
+            lb_delay_cycles = (lb_pps > 0) ? (tsc_hz / lb_pps) : tsc_hz;
+            lb_next_send = rte_get_tsc_cycles() + stagger_offset;
+        }
+        if (params->cross_vl_count > 0 && params->cross_gbps > 0.0) {
+            uint64_t cr_pps = (uint64_t)(params->cross_gbps * 1e9 / 8.0 /
+                                         (double)PACKET_SIZE);
+            cr_delay_cycles = (cr_pps > 0) ? (tsc_hz / cr_pps) : tsc_hz;
+            cr_next_send = rte_get_tsc_cycles() + stagger_offset + (tsc_hz / 400);
+        }
+    }
+
     printf("TX Worker started: Port %u, Queue %u, Lcore %u, VLAN %u, VL_RANGE [%u..%u)\n",
            params->port_id, params->queue_id, params->lcore_id, params->vlan_id, vl_start, vl_end);
 #if TOKEN_BUCKET_TX_ENABLED
@@ -1294,32 +1314,61 @@ int tx_worker(void *arg)
         // ==========================================
         uint64_t now = rte_get_tsc_cycles();
 
+        // Dual-lane: pick lane whose next_send_time is earliest, then
+        // use its delay for pacing. Fall through to single-lane legacy
+        // path when neither lane is configured.
+        bool picked_cross = false;
+        uint64_t *active_next = &next_send_time;
+        uint64_t active_delay = delay_cycles;
+        if (dual_lane) {
+            bool lb_ok = (lb_delay_cycles > 0);
+            bool cr_ok = (cr_delay_cycles > 0);
+            if (lb_ok && cr_ok) {
+                picked_cross = (cr_next_send < lb_next_send);
+            } else {
+                picked_cross = cr_ok;
+            }
+            active_next = picked_cross ? &cr_next_send : &lb_next_send;
+            active_delay = picked_cross ? cr_delay_cycles : lb_delay_cycles;
+        }
+
         // Wait until it's time (busy-wait for precision)
-        while (now < next_send_time) {
+        while (now < *active_next) {
             rte_pause();
             now = rte_get_tsc_cycles();
         }
 
 #if TOKEN_BUCKET_TX_ENABLED
         // If we fall behind, do PHASE-PRESERVING SKIP (burst prevention)
-        // Instead of next_send_time = now, advance by N * delay_cycles
-        // This preserves the phase offset between workers
-        if (next_send_time + delay_cycles < now) {
-            uint64_t periods_behind = (now - next_send_time) / delay_cycles;
-            next_send_time += periods_behind * delay_cycles;
+        if (*active_next + active_delay < now) {
+            uint64_t periods_behind = (now - *active_next) / active_delay;
+            *active_next += periods_behind * active_delay;
         }
 #else
         // If we fall behind, DO NOT CATCH UP (burst prevention)
-        if (next_send_time + delay_cycles < now) {
-            next_send_time = now;
+        if (*active_next + active_delay < now) {
+            *active_next = now;
         }
 #endif
-        next_send_time += delay_cycles;
+        *active_next += active_delay;
 
         // Single packet allocation
         pkt = rte_pktmbuf_alloc(params->mbuf_pool);
         if (unlikely(pkt == NULL)) {
             continue;  // Timing preserved, just skip this slot
+        }
+
+        uint16_t curr_vl;
+        if (dual_lane) {
+            if (picked_cross) {
+                curr_vl = params->cross_vl_start + cr_offset;
+                cr_offset = (uint16_t)((cr_offset + 1) % params->cross_vl_count);
+            } else {
+                curr_vl = params->loopback_vl_start + lb_offset;
+                lb_offset = (uint16_t)((lb_offset + 1) % params->loopback_vl_count);
+            }
+        } else {
+            curr_vl = vl_start + current_vl_offset;
         }
 
 #if TX_TEST_MODE_ENABLED
@@ -1332,8 +1381,6 @@ int tx_worker(void *arg)
         uint64_t pkt_num = rte_atomic64_add_return(&tx_packet_count_per_port[params->port_id], 1);
         local_pkt_counter++;
 
-        uint16_t curr_vl = vl_start + current_vl_offset;
-
         if (pkt_num % TX_SKIP_EVERY_N_PACKETS == 0)
         {
             // Test mode: intentional skip — consume sequence to create gap
@@ -1341,17 +1388,17 @@ int tx_worker(void *arg)
             printf("TX Worker Port %u: SKIPPING packet #%lu (VL %u, seq %lu)\n",
                    params->port_id, pkt_num, curr_vl, skip_seq);
             rte_pktmbuf_free(pkt);
-            current_vl_offset++;
-            if (current_vl_offset >= vl_range_size)
-                current_vl_offset = 0;
+            if (!dual_lane) {
+                current_vl_offset++;
+                if (current_vl_offset >= vl_range_size)
+                    current_vl_offset = 0;
+            }
             continue;
         }
 
         // Peek sequence WITHOUT incrementing — only commit after successful send
         uint64_t seq = peek_tx_sequence(params->port_id, curr_vl);
 #else
-        uint16_t curr_vl = vl_start + current_vl_offset;
-
         // Peek sequence WITHOUT incrementing — only commit after successful send
         uint64_t seq = peek_tx_sequence(params->port_id, curr_vl);
 #endif
@@ -1405,9 +1452,11 @@ int tx_worker(void *arg)
             rte_pktmbuf_free(pkt);
         }
 
-        current_vl_offset++;
-        if (current_vl_offset >= vl_range_size)
-            current_vl_offset = 0;
+        if (!dual_lane) {
+            current_vl_offset++;
+            if (current_vl_offset >= vl_range_size)
+                current_vl_offset = 0;
+        }
     }
 
 #if TX_TEST_MODE_ENABLED
@@ -2077,28 +2126,38 @@ int start_txrx_workers(struct ports_config *ports_config, volatile bool *stop_fl
 
             double port_target_gbps = TARGET_GBPS;
 
-            // Per-queue rate scale: when a queue hosts a normal loopback flow
-            // AND extra overlaid flows (e.g., Port 0 Q0/Q2 carry J6-x loopback
-            // + J1>J2/J3>J4 cross), scale the queue rate so the loopback VMC
-            // still achieves its full standard rate and extras layer on top.
-            double rate_scale = 1.0;
+            // Dual-lane pacing: split this queue's VL-IDs into a loopback lane
+            // (SPLITMIX_CRC VMCs) at TARGET_GBPS/NUM_TX_CORES and a cross lane
+            // (PURE_PRBS VMCs) at CROSS_TARGET_GBPS per cross flow. Either lane
+            // may be empty (pure loopback or pure cross queues).
+            uint16_t lb_vl_start = 0, lb_vl_count = 0;
+            uint16_t cr_vl_start = 0, cr_vl_count = 0;
+            double   lb_gbps = 0.0, cr_gbps = 0.0;
 #if STATS_MODE_VMC
-            uint32_t loopback_vl = 0;
-            uint32_t total_vl = 0;
             for (int vi = 0; vi < VMC_PORT_COUNT; vi++) {
-                if (vmc_port_map[vi].tx_server_port == port_id &&
-                    vmc_port_map[vi].tx_server_queue == q) {
-                    total_vl += vmc_port_map[vi].vl_id_count;
-                    if (vmc_port_map[vi].payload_mode == VMC_PAYLOAD_SPLITMIX_CRC)
-                        loopback_vl += vmc_port_map[vi].vl_id_count;
+                if (vmc_port_map[vi].tx_server_port != port_id ||
+                    vmc_port_map[vi].tx_server_queue != q) continue;
+                if (vmc_port_map[vi].payload_mode == VMC_PAYLOAD_SPLITMIX_CRC) {
+                    if (lb_vl_count == 0) lb_vl_start = vmc_port_map[vi].tx_vl_id_start;
+                    lb_vl_count += vmc_port_map[vi].vl_id_count;
+                } else {
+                    if (cr_vl_count == 0) cr_vl_start = vmc_port_map[vi].tx_vl_id_start;
+                    cr_vl_count += vmc_port_map[vi].vl_id_count;
                 }
             }
-            if (loopback_vl > 0 && total_vl > loopback_vl) {
-                rate_scale = (double)total_vl / (double)loopback_vl;
-            }
+            if (lb_vl_count > 0) lb_gbps = port_target_gbps / (double)NUM_TX_CORES;
+            if (cr_vl_count > 0) cr_gbps = CROSS_TARGET_GBPS;
 #endif
-            double this_queue_gbps = (port_target_gbps / (double)NUM_TX_CORES) * rate_scale;
+            double this_queue_gbps = lb_gbps + cr_gbps;
+            if (this_queue_gbps <= 0.0)
+                this_queue_gbps = port_target_gbps / (double)NUM_TX_CORES;
             init_rate_limiter(&tx_params[tx_param_idx].limiter, this_queue_gbps, 1);
+            tx_params[tx_param_idx].loopback_vl_start = lb_vl_start;
+            tx_params[tx_param_idx].loopback_vl_count = lb_vl_count;
+            tx_params[tx_param_idx].loopback_gbps     = lb_gbps;
+            tx_params[tx_param_idx].cross_vl_start    = cr_vl_start;
+            tx_params[tx_param_idx].cross_vl_count    = cr_vl_count;
+            tx_params[tx_param_idx].cross_gbps        = cr_gbps;
 
             uint16_t tx_vlan = get_tx_vlan_for_queue(port_id, q);
 
@@ -2140,10 +2199,13 @@ int start_txrx_workers(struct ports_config *ports_config, volatile bool *stop_fl
             tx_params[tx_param_idx].pkt_config.dst_port = DEFAULT_DST_PORT;
             tx_params[tx_param_idx].pkt_config.ttl = DEFAULT_TTL;
 
-            printf("  TX Queue %u -> Lcore %2u -> VLAN %u, VL RANGE [%u..%u) Rate: %.4f Gbps (scale %.2fx)\n",
+            printf("  TX Queue %u -> Lcore %2u -> VLAN %u, VL RANGE [%u..%u) "
+                   "LoopbackLane=[%u..%u)=%.4fGbps CrossLane=[%u..%u)=%.4fGbps Total=%.4fGbps\n",
                    q, lcore_id, tx_vlan,
                    get_tx_vl_id_range_start(port_id, q), get_tx_vl_id_range_end(port_id, q),
-                   this_queue_gbps, rate_scale);
+                   lb_vl_start, lb_vl_start + lb_vl_count, lb_gbps,
+                   cr_vl_start, cr_vl_start + cr_vl_count, cr_gbps,
+                   this_queue_gbps);
 
             int ret = rte_eal_remote_launch(tx_worker,
                                             &tx_params[tx_param_idx],
