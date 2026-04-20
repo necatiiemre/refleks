@@ -1527,6 +1527,7 @@ int rx_worker(void *arg)
         uint64_t sm_fail;
         uint64_t crc_fail;
         uint64_t bit_errors;
+        uint64_t lost;
     };
     struct vmc_local_accum local_vmc[VMC_PORT_COUNT];
     memset(local_vmc, 0, sizeof(local_vmc));
@@ -1613,6 +1614,7 @@ int rx_worker(void *arg)
                 // VL-ID BASED SEQUENCE TRACKING
                 // Real-time gap detection + watermark tracking
                 // ==========================================
+                uint64_t pkt_gap_loss = 0;  // Per-packet gap, attributed to VMC below
                 if (vl_id <= MAX_VL_ID)
                 {
                     struct vl_sequence_tracker *seq_tracker = &vl_tracker->vl_trackers[vl_id];
@@ -1641,7 +1643,9 @@ int rx_worker(void *arg)
                         if (seq > expected)
                         {
                             // Gap detected - packets lost
-                            local_lost += (seq - expected);
+                            uint64_t gap = seq - expected;
+                            local_lost += gap;
+                            pkt_gap_loss = gap;
 #if TOKEN_BUCKET_TX_ENABLED
                             printf("*** LOSS DETECTED [DPDK] Port %u Q%u: VL-ID=%u expected_seq=%lu got_seq=%lu gap=%lu (src_port=%u) ***\n",
                                    params->port_id, params->queue_id, vl_id, expected, seq, seq - expected, params->src_port_id);
@@ -1684,6 +1688,9 @@ int rx_worker(void *arg)
                 uint16_t pkt_vmc_port = (vl_id <= MAX_VL_ID)
                                             ? vl_id_to_vmc_port[vl_id]
                                             : (uint16_t)VMC_VL_ID_INVALID;
+                if (pkt_gap_loss > 0 && pkt_vmc_port != VMC_VL_ID_INVALID) {
+                    local_vmc[pkt_vmc_port].lost += pkt_gap_loss;
+                }
 #endif
                 uint8_t payload_mode;
                 if (g_ate_mode_active) {
@@ -1869,13 +1876,14 @@ int rx_worker(void *arg)
                 // VMC per-port payload verification stats (per-VL-ID dispatch)
                 for (uint16_t vi = 0; vi < VMC_PORT_COUNT; vi++) {
                     struct vmc_local_accum *a = &local_vmc[vi];
-                    if (a->rx == 0) continue;
+                    if (a->rx == 0 && a->lost == 0) continue;
                     rte_atomic64_add(&vmc_stats[vi].total_rx_pkts, a->rx);
                     rte_atomic64_add(&vmc_stats[vi].good_pkts, a->good);
                     rte_atomic64_add(&vmc_stats[vi].bad_pkts, a->bad);
                     rte_atomic64_add(&vmc_stats[vi].splitmix_fail, a->sm_fail);
                     rte_atomic64_add(&vmc_stats[vi].crc32_fail, a->crc_fail);
                     rte_atomic64_add(&vmc_stats[vi].bit_errors, a->bit_errors);
+                    rte_atomic64_add(&vmc_stats[vi].lost_pkts, a->lost);
                     memset(a, 0, sizeof(*a));
                 }
 #endif
@@ -1902,26 +1910,30 @@ int rx_worker(void *arg)
 #if STATS_MODE_VMC
         for (uint16_t vi = 0; vi < VMC_PORT_COUNT; vi++) {
             struct vmc_local_accum *a = &local_vmc[vi];
-            if (a->rx == 0) continue;
+            if (a->rx == 0 && a->lost == 0) continue;
             rte_atomic64_add(&vmc_stats[vi].total_rx_pkts, a->rx);
             rte_atomic64_add(&vmc_stats[vi].good_pkts, a->good);
             rte_atomic64_add(&vmc_stats[vi].bad_pkts, a->bad);
             rte_atomic64_add(&vmc_stats[vi].splitmix_fail, a->sm_fail);
             rte_atomic64_add(&vmc_stats[vi].crc32_fail, a->crc_fail);
             rte_atomic64_add(&vmc_stats[vi].bit_errors, a->bit_errors);
+            rte_atomic64_add(&vmc_stats[vi].lost_pkts, a->lost);
         }
 #endif
     }
 
     // ==========================================
-    // CALCULATE LOST PACKETS (watermark-based)
+    // CALCULATE LOST PACKETS (watermark-based, shutdown reconciliation)
     // Lost = (max_seq + 1) - pkt_count for each VL-ID
+    //
+    // Real-time gap detection already populates vmc_stats[].lost_pkts per VMC
+    // during the RX loop, so we don't re-add here (that would double count).
+    // Instead we reconcile: if the watermark disagrees with the live counter
+    // (e.g. due to reorder over-count at real time, or missed gap at the tail
+    // of the run), overwrite with the watermark value — it's the accurate
+    // total. Port-wide rx_stats lost_pkts still gets the watermark added.
     // ==========================================
 #if STATS_MODE_VMC
-    // VMC mode: iterate every VMC flow that terminates on this (port, queue)
-    // and attribute lost packets per-flow via its declared VL-ID range.
-    // This handles shared queues where multiple VMC flows coexist (e.g.
-    // Port 0 Q0 carrying both normal loopback and pure-PRBS cross return).
     {
         uint64_t queue_lost_total = 0;
         for (uint16_t vi = 0; vi < VMC_PORT_COUNT; vi++) {
@@ -1952,9 +1964,11 @@ int rx_worker(void *arg)
                     vmc_lost += (expected_count - pkt_count);
             }
 
+            // Reconcile: replace the real-time (possibly reorder-inflated)
+            // value with the accurate watermark total.
+            rte_atomic64_set(&vmc_stats[vi].lost_pkts, (int64_t)vmc_lost);
+            queue_lost_total += vmc_lost;
             if (vmc_lost > 0) {
-                rte_atomic64_add(&vmc_stats[vi].lost_pkts, vmc_lost);
-                queue_lost_total += vmc_lost;
                 printf("RX Worker Port %u Q%u (VMC %u): %lu lost packets (VL-ID %u-%u)\n",
                        params->port_id, params->queue_id, vi,
                        vmc_lost, vl_start, vl_end - 1);
