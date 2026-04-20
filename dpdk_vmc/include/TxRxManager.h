@@ -200,6 +200,13 @@ struct rx_worker_params
 void init_vlan_config(void);
 
 /**
+ * Read the current TX sequence counter for a (port, VL-ID). Matches the
+ * number of packets committed on TX for that VL-ID; used by stats display
+ * to split per-VMC TX counters when a queue carries multiple flows.
+ */
+uint64_t get_tx_vl_sequence(uint16_t port_id, uint16_t vl_id);
+
+/**
  * Get TX VLAN ID for a specific port and queue
  */
 uint16_t get_tx_vlan_for_queue(uint16_t port_id, uint16_t queue_id);

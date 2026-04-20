@@ -172,6 +172,17 @@ static inline uint64_t get_next_tx_sequence(uint16_t port_id, uint16_t vl_id)
 }
 
 /**
+ * Read TX sequence counter for a (port, VL-ID) — public accessor used by
+ * stats display to split per-VMC TX counters across multiple flows.
+ */
+uint64_t get_tx_vl_sequence(uint16_t port_id, uint16_t vl_id)
+{
+    if (vl_id > MAX_VL_ID || port_id >= MAX_PORTS)
+        return 0;
+    return __atomic_load_n(&tx_vl_sequences[port_id].sequence[vl_id], __ATOMIC_RELAXED);
+}
+
+/**
  * Peek current sequence for a VL-ID without incrementing (thread-safe)
  * Use with commit_tx_sequence() for send-then-commit pattern.
  */
@@ -517,18 +528,19 @@ void init_vmc_port_map(void)
     printf("VMC Ports: %d (DPDK: %d, Raw: 2)\n", VMC_PORT_COUNT, VMC_DPDK_PORT_COUNT);
     printf("VL-ID → VMC Port lookup table built (payload mode dispatch)\n");
 
-    // Print summary table
-    printf("\n  VMC Port | VMC RX (Srv TX)      | VMC TX (Srv RX)      | VL-ID range  | Mode\n");
-    printf("  ---------+----------------------+----------------------+--------------+------------\n");
+    // Print summary table (TX and RX VL-ID spans; equal for pure-PRBS cross)
+    printf("\n  VMC Port | VMC RX (Srv TX)      | VMC TX (Srv RX)      | TX VL-ID     | RX VL-ID     | Mode\n");
+    printf("  ---------+----------------------+----------------------+--------------+--------------+------------\n");
     for (int i = 0; i < VMC_DPDK_PORT_COUNT; i++) {
         const struct vmc_port_map_entry *e = &vmc_port_map[i];
         const char *mode = (e->payload_mode == VMC_PAYLOAD_PURE_PRBS) ? "pure PRBS"
                                                                       : "splitmix+CRC";
-        printf("    %2d     | SrvPort%u Q%u VLAN%-3u | SrvPort%u Q%u VLAN%-3u | [%4u..%4u) | %s\n",
+        printf("    %2d     | SrvPort%u Q%u VLAN%-3u | SrvPort%u Q%u VLAN%-3u | [%4u..%4u) | [%4u..%4u) | %s\n",
                e->vmc_port_id,
                e->rx_server_port, e->rx_server_queue, e->rx_vlan,
                e->tx_server_port, e->tx_server_queue, e->tx_vlan,
-               e->vl_id_start, e->vl_id_start + e->vl_id_count,
+               e->tx_vl_id_start, e->tx_vl_id_start + e->vl_id_count,
+               e->vl_id_start,    e->vl_id_start    + e->vl_id_count,
                mode);
     }
     printf("================================================\n\n");
