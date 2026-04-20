@@ -2076,7 +2076,29 @@ int start_txrx_workers(struct ports_config *ports_config, volatile bool *stop_fl
             }
 
             double port_target_gbps = TARGET_GBPS;
-            init_rate_limiter(&tx_params[tx_param_idx].limiter, port_target_gbps, NUM_TX_CORES);
+
+            // Per-queue rate scale: when a queue hosts a normal loopback flow
+            // AND extra overlaid flows (e.g., Port 0 Q0/Q2 carry J6-x loopback
+            // + J1>J2/J3>J4 cross), scale the queue rate so the loopback VMC
+            // still achieves its full standard rate and extras layer on top.
+            double rate_scale = 1.0;
+#if STATS_MODE_VMC
+            uint32_t loopback_vl = 0;
+            uint32_t total_vl = 0;
+            for (int vi = 0; vi < VMC_PORT_COUNT; vi++) {
+                if (vmc_port_map[vi].tx_server_port == port_id &&
+                    vmc_port_map[vi].tx_server_queue == q) {
+                    total_vl += vmc_port_map[vi].vl_id_count;
+                    if (vmc_port_map[vi].payload_mode == VMC_PAYLOAD_SPLITMIX_CRC)
+                        loopback_vl += vmc_port_map[vi].vl_id_count;
+                }
+            }
+            if (loopback_vl > 0 && total_vl > loopback_vl) {
+                rate_scale = (double)total_vl / (double)loopback_vl;
+            }
+#endif
+            double this_queue_gbps = (port_target_gbps / (double)NUM_TX_CORES) * rate_scale;
+            init_rate_limiter(&tx_params[tx_param_idx].limiter, this_queue_gbps, 1);
 
             uint16_t tx_vlan = get_tx_vlan_for_queue(port_id, q);
 
@@ -2118,10 +2140,10 @@ int start_txrx_workers(struct ports_config *ports_config, volatile bool *stop_fl
             tx_params[tx_param_idx].pkt_config.dst_port = DEFAULT_DST_PORT;
             tx_params[tx_param_idx].pkt_config.ttl = DEFAULT_TTL;
 
-            printf("  TX Queue %u -> Lcore %2u -> VLAN %u, VL RANGE [%u..%u) Rate: %.1f Gbps\n",
+            printf("  TX Queue %u -> Lcore %2u -> VLAN %u, VL RANGE [%u..%u) Rate: %.4f Gbps (scale %.2fx)\n",
                    q, lcore_id, tx_vlan,
                    get_tx_vl_id_range_start(port_id, q), get_tx_vl_id_range_end(port_id, q),
-                   port_target_gbps);
+                   this_queue_gbps, rate_scale);
 
             int ret = rte_eal_remote_launch(tx_worker,
                                             &tx_params[tx_param_idx],
