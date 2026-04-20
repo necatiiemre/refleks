@@ -166,12 +166,18 @@ struct port_vlan_config
 };
 
 // Per-port VLAN/VL-ID template (queue index ↔ VL range start matches)
-// Unit test mode: loopback (same port TX→RX), cross for J6-2↔J6-4
-// VL-ID counts are variable per queue (tx_vl_counts required)
+// Unit test mode:
+//   Port 0 Q0/Q2 carry BOTH normal loopback (splitmix+CRC) and new pure-PRBS
+//   cross traffic on the same queue, distinguished by VL-ID:
+//     Q0 TX: 602..611 loopback + 612..617 cross to Q1   (total 16 VL-IDs)
+//     Q1 TX: 622..627 pure-PRBS cross to Q0            (6 VL-IDs)
+//     Q2 TX: 346..355 loopback + 356..361 cross to Q3  (total 16 VL-IDs)
+//     Q3 TX: 366..371 pure-PRBS cross to Q2            (6 VL-IDs)
+//   Other ports remain plain loopback.
 #define PORT_VLAN_CONFIG_INIT                                                                                                                                                                                                                               \
   {                                                                                                                                                                                                                                                         \
-    /* Port 0: TX 105-108, RX 233-236 (J6-1 loopback, J6-2/J6-4 cross, J6-3 loopback) */                                                                                                                                                                  \
-    {.tx_vlans = {105, 106, 107, 108}, .tx_vlan_count = 4, .rx_vlans = {233, 234, 235, 236}, .rx_vlan_count = 4, .tx_vl_ids = {602, 622, 346, 366}, .rx_vl_ids = {592, 612, 336, 356}, .tx_vl_counts = {10, 6, 10, 6}},       /* Port 1 */                 \
+    /* Port 0: TX 105-108, RX 233-236 (mixed loopback + pure-PRBS cross on Q0/Q2) */                                                                                                                                                                      \
+    {.tx_vlans = {105, 106, 107, 108}, .tx_vlan_count = 4, .rx_vlans = {233, 234, 235, 236}, .rx_vlan_count = 4, .tx_vl_ids = {602, 622, 346, 366}, .rx_vl_ids = {592, 612, 336, 356}, .tx_vl_counts = {16, 6, 16, 6}},       /* Port 1 */                 \
         {.tx_vlans = {109, 110, 111, 112}, .tx_vlan_count = 4, .rx_vlans = {237, 238, 239, 240}, .rx_vlan_count = 4, .tx_vl_ids = {522, 542, 562, 582}, .rx_vl_ids = {512, 532, 552, 572}, .tx_vl_counts = {10, 10, 10, 10}}, /* Port 2 */                 \
         {.tx_vlans = {97, 98, 99, 100}, .tx_vlan_count = 4, .rx_vlans = {225, 226, 227, 228}, .rx_vlan_count = 4, .tx_vl_ids = {160, 224, 417, 480}, .rx_vl_ids = {128, 192, 385, 448}, .tx_vl_counts = {32, 28, 31, 28}},    /* Port 3 */                 \
         {.tx_vlans = {101, 102, 103, 104}, .tx_vlan_count = 4, .rx_vlans = {229, 230, 231, 232}, .rx_vlan_count = 4, .tx_vl_ids = {266, 286, 306, 326}, .rx_vl_ids = {256, 276, 296, 316}, .tx_vl_counts = {10, 10, 10, 10}},                              \
@@ -427,25 +433,33 @@ struct dpdk_ext_tx_port_config
 #define STATS_MODE_VMC 1
 #endif
 
-// VMC port count: 16 DPDK ports (4 server ports × 4 VLANs)
-#define VMC_PORT_COUNT 16
-#define VMC_DPDK_PORT_COUNT 16
+// VMC port count: 16 loopback + 4 pure-PRBS cross entries = 20
+// Slots 0-15: legacy VMC ports (0-3 on Port 0 include normal loopbacks;
+//             old splitmix+CRC cross at 1/3 has been repurposed to pure-PRBS cross)
+// Slots 16-17: extra pure-PRBS cross entries for the reverse direction
+#define VMC_PORT_COUNT 18
+#define VMC_DPDK_PORT_COUNT 18
 
 // 1 VLAN per VMC port
 #define VMC_VLANS_PER_PORT 1
 
+// Payload verification mode for a VMC flow (used on server RX)
+#define VMC_PAYLOAD_SPLITMIX_CRC 0  // Legacy: VMC applies SplitMix64 XOR + CRC32C
+#define VMC_PAYLOAD_PURE_PRBS    1  // New cross: plain PRBS, no SplitMix/CRC
+
 // ==========================================
 // VMC PORT MAPPING TABLE
 // ==========================================
-// Each VMC port: TX/RX from VMC perspective
+// Each VMC port describes one directional flow: Server TX → VMC → Server RX.
 //   VMC RX = Server sends → VMC receives (server_tx_port, rx_vlan)
 //   VMC TX = VMC sends → Server receives (server_rx_port, tx_vlan)
 //
-// VMC Port 0-15: DPDK ports (4 ports × 4 VLANs)
-// Pairs: Port 0↔1, Port 2↔3
+// Flows are distinguished by VL-ID range (vl_id_start, vl_id_count), so
+// multiple flows can share a server queue / VLAN as long as VL-IDs don't
+// overlap (e.g. Port 0 Q0 normal loopback + Q1→Q0 pure-PRBS cross return).
 
 struct vmc_port_map_entry {
-    uint16_t vmc_port_id;       // VMC port number (0-15)
+    uint16_t vmc_port_id;       // VMC port number
 
     // VMC RX (Server → VMC): Server sends from this VLAN
     uint16_t rx_vlan;           // Server TX VLAN (VMC receives this VLAN)
@@ -456,54 +470,117 @@ struct vmc_port_map_entry {
     uint16_t tx_vlan;           // Server RX VLAN (VMC sends from this VLAN)
     uint16_t tx_server_port;    // Server DPDK port (the one that RXs)
     uint16_t tx_server_queue;   // Server RX queue index (0-3)
+
+    // VL-ID range for this flow (unchanged end-to-end: server TX == server RX)
+    uint16_t vl_id_start;
+    uint16_t vl_id_count;
+
+    // Payload verification mode (see VMC_PAYLOAD_* above)
+    uint8_t  payload_mode;
 };
 
-// VMC Port Mapping Table (4 server ports × 4 VLANs = 16 VMC ports)
-// Loopback: same port TX→RX, except Cross (J6-2↔J6-4)
-// Format: {vmc_port, rx_vlan, rx_srv_port, rx_srv_queue, tx_vlan, tx_srv_port, tx_srv_queue}
+// VMC Port Mapping Table (flow-oriented; 18 entries)
+// Port 0 layout:
+//   VMC 0:  Q0 J6-1 normal loopback  (vl 602..611, splitmix+CRC)
+//   VMC 1:  Q0→Q1 J6-1→J6-2 cross    (vl 612..617, pure PRBS)
+//   VMC 2:  Q2 J6-3 normal loopback  (vl 346..355, splitmix+CRC)
+//   VMC 3:  Q2→Q3 J6-3→J6-4 cross    (vl 356..361, pure PRBS)
+//   VMC 16: Q1→Q0 J6-2→J6-1 cross    (vl 622..627, pure PRBS)
+//   VMC 17: Q3→Q2 J6-4→J6-3 cross    (vl 366..371, pure PRBS)
+// Ports 1-3 (VMC 4-15): unchanged loopbacks.
 #define VMC_PORT_MAP_INIT {                                                                         \
-    /* VMC 0-3: Port 0 (J6-1 loopback, J6-2/J6-4 cross, J6-3 loopback) */                          \
+    /* VMC 0: Port 0 Q0 J6-1 normal loopback */                                                     \
     {.vmc_port_id = 0,  .rx_vlan = 105, .rx_server_port = 0, .rx_server_queue = 0,                  \
-                         .tx_vlan = 233, .tx_server_port = 0, .tx_server_queue = 0},                 \
-    {.vmc_port_id = 1,  .rx_vlan = 106, .rx_server_port = 0, .rx_server_queue = 1,                  \
-                         .tx_vlan = 236, .tx_server_port = 0, .tx_server_queue = 3},  /* Cross */    \
+                         .tx_vlan = 233, .tx_server_port = 0, .tx_server_queue = 0,                 \
+                         .vl_id_start = 602, .vl_id_count = 10,                                     \
+                         .payload_mode = VMC_PAYLOAD_SPLITMIX_CRC},                                 \
+    /* VMC 1: Port 0 Q0→Q1 J6-1→J6-2 pure-PRBS cross */                                             \
+    {.vmc_port_id = 1,  .rx_vlan = 105, .rx_server_port = 0, .rx_server_queue = 0,                  \
+                         .tx_vlan = 234, .tx_server_port = 0, .tx_server_queue = 1,                 \
+                         .vl_id_start = 612, .vl_id_count = 6,                                      \
+                         .payload_mode = VMC_PAYLOAD_PURE_PRBS},                                    \
+    /* VMC 2: Port 0 Q2 J6-3 normal loopback */                                                     \
     {.vmc_port_id = 2,  .rx_vlan = 107, .rx_server_port = 0, .rx_server_queue = 2,                  \
-                         .tx_vlan = 235, .tx_server_port = 0, .tx_server_queue = 2},                 \
-    {.vmc_port_id = 3,  .rx_vlan = 108, .rx_server_port = 0, .rx_server_queue = 3,                  \
-                         .tx_vlan = 234, .tx_server_port = 0, .tx_server_queue = 1},  /* Cross */    \
+                         .tx_vlan = 235, .tx_server_port = 0, .tx_server_queue = 2,                 \
+                         .vl_id_start = 346, .vl_id_count = 10,                                     \
+                         .payload_mode = VMC_PAYLOAD_SPLITMIX_CRC},                                 \
+    /* VMC 3: Port 0 Q2→Q3 J6-3→J6-4 pure-PRBS cross */                                             \
+    {.vmc_port_id = 3,  .rx_vlan = 107, .rx_server_port = 0, .rx_server_queue = 2,                  \
+                         .tx_vlan = 236, .tx_server_port = 0, .tx_server_queue = 3,                 \
+                         .vl_id_start = 356, .vl_id_count = 6,                                      \
+                         .payload_mode = VMC_PAYLOAD_PURE_PRBS},                                    \
     /* VMC 4-7: Port 1 (J7-1..J7-4, all loopback) */                                                \
     {.vmc_port_id = 4,  .rx_vlan = 109, .rx_server_port = 1, .rx_server_queue = 0,                  \
-                         .tx_vlan = 237, .tx_server_port = 1, .tx_server_queue = 0},                 \
+                         .tx_vlan = 237, .tx_server_port = 1, .tx_server_queue = 0,                 \
+                         .vl_id_start = 522, .vl_id_count = 10,                                     \
+                         .payload_mode = VMC_PAYLOAD_SPLITMIX_CRC},                                 \
     {.vmc_port_id = 5,  .rx_vlan = 110, .rx_server_port = 1, .rx_server_queue = 1,                  \
-                         .tx_vlan = 238, .tx_server_port = 1, .tx_server_queue = 1},                 \
+                         .tx_vlan = 238, .tx_server_port = 1, .tx_server_queue = 1,                 \
+                         .vl_id_start = 542, .vl_id_count = 10,                                     \
+                         .payload_mode = VMC_PAYLOAD_SPLITMIX_CRC},                                 \
     {.vmc_port_id = 6,  .rx_vlan = 111, .rx_server_port = 1, .rx_server_queue = 2,                  \
-                         .tx_vlan = 239, .tx_server_port = 1, .tx_server_queue = 2},                 \
+                         .tx_vlan = 239, .tx_server_port = 1, .tx_server_queue = 2,                 \
+                         .vl_id_start = 562, .vl_id_count = 10,                                     \
+                         .payload_mode = VMC_PAYLOAD_SPLITMIX_CRC},                                 \
     {.vmc_port_id = 7,  .rx_vlan = 112, .rx_server_port = 1, .rx_server_queue = 3,                  \
-                         .tx_vlan = 240, .tx_server_port = 1, .tx_server_queue = 3},                 \
+                         .tx_vlan = 240, .tx_server_port = 1, .tx_server_queue = 3,                 \
+                         .vl_id_start = 582, .vl_id_count = 10,                                     \
+                         .payload_mode = VMC_PAYLOAD_SPLITMIX_CRC},                                 \
     /* VMC 8-11: Port 2 (J4-1..J4-4, all loopback) */                                               \
     {.vmc_port_id = 8,  .rx_vlan = 97,  .rx_server_port = 2, .rx_server_queue = 0,                  \
-                         .tx_vlan = 225, .tx_server_port = 2, .tx_server_queue = 0},                 \
+                         .tx_vlan = 225, .tx_server_port = 2, .tx_server_queue = 0,                 \
+                         .vl_id_start = 160, .vl_id_count = 32,                                     \
+                         .payload_mode = VMC_PAYLOAD_SPLITMIX_CRC},                                 \
     {.vmc_port_id = 9,  .rx_vlan = 98,  .rx_server_port = 2, .rx_server_queue = 1,                  \
-                         .tx_vlan = 226, .tx_server_port = 2, .tx_server_queue = 1},                 \
+                         .tx_vlan = 226, .tx_server_port = 2, .tx_server_queue = 1,                 \
+                         .vl_id_start = 224, .vl_id_count = 28,                                     \
+                         .payload_mode = VMC_PAYLOAD_SPLITMIX_CRC},                                 \
     {.vmc_port_id = 10, .rx_vlan = 99,  .rx_server_port = 2, .rx_server_queue = 2,                  \
-                         .tx_vlan = 227, .tx_server_port = 2, .tx_server_queue = 2},                 \
+                         .tx_vlan = 227, .tx_server_port = 2, .tx_server_queue = 2,                 \
+                         .vl_id_start = 417, .vl_id_count = 31,                                     \
+                         .payload_mode = VMC_PAYLOAD_SPLITMIX_CRC},                                 \
     {.vmc_port_id = 11, .rx_vlan = 100, .rx_server_port = 2, .rx_server_queue = 3,                  \
-                         .tx_vlan = 228, .tx_server_port = 2, .tx_server_queue = 3},                 \
+                         .tx_vlan = 228, .tx_server_port = 2, .tx_server_queue = 3,                 \
+                         .vl_id_start = 480, .vl_id_count = 28,                                     \
+                         .payload_mode = VMC_PAYLOAD_SPLITMIX_CRC},                                 \
     /* VMC 12-15: Port 3 (J5-1..J5-4, all loopback) */                                              \
     {.vmc_port_id = 12, .rx_vlan = 101, .rx_server_port = 3, .rx_server_queue = 0,                  \
-                         .tx_vlan = 229, .tx_server_port = 3, .tx_server_queue = 0},                 \
+                         .tx_vlan = 229, .tx_server_port = 3, .tx_server_queue = 0,                 \
+                         .vl_id_start = 266, .vl_id_count = 10,                                     \
+                         .payload_mode = VMC_PAYLOAD_SPLITMIX_CRC},                                 \
     {.vmc_port_id = 13, .rx_vlan = 102, .rx_server_port = 3, .rx_server_queue = 1,                  \
-                         .tx_vlan = 230, .tx_server_port = 3, .tx_server_queue = 1},                 \
+                         .tx_vlan = 230, .tx_server_port = 3, .tx_server_queue = 1,                 \
+                         .vl_id_start = 286, .vl_id_count = 10,                                     \
+                         .payload_mode = VMC_PAYLOAD_SPLITMIX_CRC},                                 \
     {.vmc_port_id = 14, .rx_vlan = 103, .rx_server_port = 3, .rx_server_queue = 2,                  \
-                         .tx_vlan = 231, .tx_server_port = 3, .tx_server_queue = 2},                 \
+                         .tx_vlan = 231, .tx_server_port = 3, .tx_server_queue = 2,                 \
+                         .vl_id_start = 306, .vl_id_count = 10,                                     \
+                         .payload_mode = VMC_PAYLOAD_SPLITMIX_CRC},                                 \
     {.vmc_port_id = 15, .rx_vlan = 104, .rx_server_port = 3, .rx_server_queue = 3,                  \
-                         .tx_vlan = 232, .tx_server_port = 3, .tx_server_queue = 3},                 \
+                         .tx_vlan = 232, .tx_server_port = 3, .tx_server_queue = 3,                 \
+                         .vl_id_start = 326, .vl_id_count = 10,                                     \
+                         .payload_mode = VMC_PAYLOAD_SPLITMIX_CRC},                                 \
+    /* VMC 16: Port 0 Q1→Q0 J6-2→J6-1 pure-PRBS cross (reverse of VMC 1) */                         \
+    {.vmc_port_id = 16, .rx_vlan = 106, .rx_server_port = 0, .rx_server_queue = 1,                  \
+                         .tx_vlan = 233, .tx_server_port = 0, .tx_server_queue = 0,                 \
+                         .vl_id_start = 622, .vl_id_count = 6,                                      \
+                         .payload_mode = VMC_PAYLOAD_PURE_PRBS},                                    \
+    /* VMC 17: Port 0 Q3→Q2 J6-4→J6-3 pure-PRBS cross (reverse of VMC 3) */                         \
+    {.vmc_port_id = 17, .rx_vlan = 108, .rx_server_port = 0, .rx_server_queue = 3,                  \
+                         .tx_vlan = 235, .tx_server_port = 0, .tx_server_queue = 2,                 \
+                         .vl_id_start = 366, .vl_id_count = 6,                                      \
+                         .payload_mode = VMC_PAYLOAD_PURE_PRBS},                                    \
 }
 
 // VLAN → VMC port lookup (fast access)
 // Index = VLAN ID, Value = VMC port number (0xFF = undefined)
 #define VMC_VLAN_LOOKUP_SIZE 257  // VLAN 0-256
 #define VMC_VLAN_INVALID 0xFF
+
+// VL-ID → VMC port lookup. Multiple flows (e.g. normal loopback + pure-PRBS
+// cross) can share the same server queue/VLAN, so per-packet dispatch is
+// keyed on VL-ID. Uses 16-bit slots to accommodate VMC_PORT_COUNT > 255.
+#define VMC_VL_ID_INVALID 0xFFFF
 
 // ==========================================
 // VMC PORT DISPLAY GROUPING (VSCPU / FCPU / CROSS)
@@ -519,22 +596,25 @@ struct vmc_port_map_entry {
 //
 // VSCPU: Port 2 (J4-1,J4-2), Port 3 (J5-1..J5-4), Port 0 (J6-3)
 // FCPU:  Port 2 (J4-3,J4-4), Port 1 (J7-1..J7-4), Port 0 (J6-1)
-// Cross: Port 0 (J6-2 TX→J6-4 RX, J6-4 TX→J6-2 RX)
+// Cross: Port 0 pure-PRBS cross flows (J6-1↔J6-2, J6-3↔J6-4)
 
 #define VSCPU_COUNT  7
 #define FCPU_COUNT   7
-#define CROSS_COUNT  2
+#define CROSS_COUNT  4
 
 static const uint16_t vscpu_vmc_indices[VSCPU_COUNT] = {8, 9, 12, 13, 14, 15, 2};
 static const uint16_t fcpu_vmc_indices[FCPU_COUNT]    = {10, 11, 4, 5, 6, 7, 0};
-static const uint16_t cross_vmc_indices[CROSS_COUNT]  = {1, 3};
+// Cross directions: {Q0→Q1, Q1→Q0, Q2→Q3, Q3→Q2}
+static const uint16_t cross_vmc_indices[CROSS_COUNT]  = {1, 16, 3, 17};
 
-// J-label for each VMC port (indexed by VMC port number 0-15)
+// J-label for each VMC port (indexed by VMC port number)
+// Pure-PRBS cross labels use ASCII arrow "J1>J2" to keep %-6s alignment.
 static const char * const vmc_port_labels[VMC_PORT_COUNT] = {
-    "J6-1", "J6-2", "J6-3", "J6-4",   /* VMC 0-3:  Port 0 Q0-Q3 */
-    "J7-1", "J7-2", "J7-3", "J7-4",   /* VMC 4-7:  Port 1 Q0-Q3 */
-    "J4-1", "J4-2", "J4-3", "J4-4",   /* VMC 8-11: Port 2 Q0-Q3 */
-    "J5-1", "J5-2", "J5-3", "J5-4"    /* VMC 12-15: Port 3 Q0-Q3 */
+    "J6-1",  "J1>J2", "J6-3",  "J3>J4",   /* VMC 0-3:  Port 0 (loop, cross, loop, cross) */
+    "J7-1",  "J7-2",  "J7-3",  "J7-4",    /* VMC 4-7:  Port 1 Q0-Q3 */
+    "J4-1",  "J4-2",  "J4-3",  "J4-4",    /* VMC 8-11: Port 2 Q0-Q3 */
+    "J5-1",  "J5-2",  "J5-3",  "J5-4",    /* VMC 12-15: Port 3 Q0-Q3 */
+    "J2>J1", "J4>J3"                       /* VMC 16-17: Port 0 reverse-direction crosses */
 };
 
 #endif /* CONFIG_H */

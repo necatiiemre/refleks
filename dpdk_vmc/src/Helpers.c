@@ -160,8 +160,8 @@ static void helper_print_vmc_stats(const struct ports_config *ports_config,
     printf("\n  === FCPU (Server Port 2: J4-3,J4-4 | Port 1: J7-1..J7-4 | Port 0: J6-1) ===\n");
     print_vmc_table_group(fcpu_vmc_indices, FCPU_COUNT, port_hw_stats);
 
-    // Table 3: Cross
-    printf("\n  === CROSS (Port 0: J6-2 TX->J6-4 RX, J6-4 TX->J6-2 RX) ===\n");
+    // Table 3: Cross (pure-PRBS, no SplitMix/CRC)
+    printf("\n  === CROSS (Pure PRBS: J6-1↔J6-2, J6-3↔J6-4) ===\n");
     print_vmc_table_group(cross_vmc_indices, CROSS_COUNT, port_hw_stats);
 
     // Warnings

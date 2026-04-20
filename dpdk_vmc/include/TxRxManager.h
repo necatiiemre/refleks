@@ -85,8 +85,14 @@ extern struct vmc_port_stats vmc_stats[VMC_PORT_COUNT];
 // VMC port mapping table (loaded from config at runtime)
 extern struct vmc_port_map_entry vmc_port_map[VMC_PORT_COUNT];
 
-// VLAN → VMC port fast lookup table
+// VLAN → VMC port fast lookup table (legacy; ambiguous when multiple flows
+// share a VLAN — use vl_id_to_vmc_port[] for per-packet dispatch).
 extern uint8_t vlan_to_vmc_port[VMC_VLAN_LOOKUP_SIZE];
+
+// VL-ID → VMC port lookup (indexed by VL-ID, sized MAX_VL_ID+1).
+// Each active VL-ID maps to exactly one VMC flow; VMC_VL_ID_INVALID marks
+// unassigned slots. Built by init_vmc_port_map() from VMC_PORT_MAP_INIT.
+extern uint16_t vl_id_to_vmc_port[MAX_VL_ID + 1];
 
 /**
  * Initialize VMC port mapping and VLAN lookup table
