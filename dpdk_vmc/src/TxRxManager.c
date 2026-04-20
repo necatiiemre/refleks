@@ -2130,13 +2130,17 @@ int start_txrx_workers(struct ports_config *ports_config, volatile bool *stop_fl
             // (SPLITMIX_CRC VMCs) at TARGET_GBPS/NUM_TX_CORES and a cross lane
             // (PURE_PRBS VMCs) at CROSS_TARGET_GBPS per cross flow. Either lane
             // may be empty (pure loopback or pure cross queues).
+            //
+            // NOTE: on the server TX side we match by rx_server_{port,queue}
+            // (VMC's point of view: server TX == VMC RX). tx_server_* refers
+            // to the server's RX side and must not be used here.
             uint16_t lb_vl_start = 0, lb_vl_count = 0;
             uint16_t cr_vl_start = 0, cr_vl_count = 0;
             double   lb_gbps = 0.0, cr_gbps = 0.0;
 #if STATS_MODE_VMC
             for (int vi = 0; vi < VMC_PORT_COUNT; vi++) {
-                if (vmc_port_map[vi].tx_server_port != port_id ||
-                    vmc_port_map[vi].tx_server_queue != q) continue;
+                if (vmc_port_map[vi].rx_server_port != port_id ||
+                    vmc_port_map[vi].rx_server_queue != q) continue;
                 if (vmc_port_map[vi].payload_mode == VMC_PAYLOAD_SPLITMIX_CRC) {
                     if (lb_vl_count == 0) lb_vl_start = vmc_port_map[vi].tx_vl_id_start;
                     lb_vl_count += vmc_port_map[vi].vl_id_count;
