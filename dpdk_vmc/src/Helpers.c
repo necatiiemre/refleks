@@ -23,6 +23,10 @@ static inline double to_gbps(uint64_t bytes) {
     return (bytes * 8.0) / 1e9;
 }
 
+#if STATS_MODE_VMC
+static void reset_vmc_prev_bytes(void);
+#endif
+
 void helper_reset_stats(const struct ports_config *ports_config,
                         uint64_t prev_tx_bytes[], uint64_t prev_rx_bytes[])
 {
@@ -34,11 +38,16 @@ void helper_reset_stats(const struct ports_config *ports_config,
         prev_rx_bytes[port_id] = 0;
     }
 
-    // Reset RX validation statistics (PRBS)
+    // Reset RX validation statistics (PRBS) + per-VL sequence trackers
     init_rx_stats();
+
+    // Reset TX VL-ID commit counters so shared-queue VMC RX
+    // (Σ tx_vl_sequence) does not carry warm-up residue into the test window.
+    reset_tx_vl_sequences();
 
 #if STATS_MODE_VMC
     init_vmc_stats();
+    reset_vmc_prev_bytes();
 #endif
 }
 
@@ -54,6 +63,17 @@ void helper_reset_stats(const struct ports_config *ports_config,
 // Per-VMC-port prev bytes for delta calculation
 static uint64_t vmc_prev_tx_bytes[VMC_PORT_COUNT];
 static uint64_t vmc_prev_rx_bytes[VMC_PORT_COUNT];
+
+// Zero the per-VMC prev-byte baselines. Invoked from helper_reset_stats at
+// warm-up → test transition so the first test-window Gbps delta is computed
+// against zero, not the warm-up byte total.
+static void reset_vmc_prev_bytes(void)
+{
+    for (uint16_t i = 0; i < VMC_PORT_COUNT; i++) {
+        vmc_prev_tx_bytes[i] = 0;
+        vmc_prev_rx_bytes[i] = 0;
+    }
+}
 
 // Count VMC flows that share the same server RX (queue) — used to decide
 // whether the HW per-queue counter is dedicated to this VMC (single flow)

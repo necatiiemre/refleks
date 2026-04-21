@@ -218,6 +218,12 @@ void init_vlan_config(void);
 uint64_t get_tx_vl_sequence(uint16_t port_id, uint16_t vl_id);
 
 /**
+ * Zero every TX VL-ID sequence counter. Call at warm-up → test transition
+ * so shared-queue VMC RX (Σ tx_vl_sequence) does not include warm-up commits.
+ */
+void reset_tx_vl_sequences(void);
+
+/**
  * Get TX VLAN ID for a specific port and queue
  */
 uint16_t get_tx_vlan_for_queue(uint16_t port_id, uint16_t queue_id);

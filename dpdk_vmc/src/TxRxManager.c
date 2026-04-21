@@ -157,6 +157,25 @@ static void init_tx_vl_sequences(void)
 }
 
 /**
+ * Zero all TX VL-ID sequence counters without touching the spinlocks.
+ * Called at warm-up → test transition so shared-queue stats do not carry
+ * over warm-up residue into the test window. Takes the per-VL spinlocks
+ * to avoid racing with in-flight peek/commit.
+ */
+void reset_tx_vl_sequences(void)
+{
+    for (int port = 0; port < MAX_PORTS; port++)
+    {
+        for (int vl = 0; vl <= MAX_VL_ID; vl++)
+        {
+            rte_spinlock_lock(&tx_vl_sequences[port].locks[vl]);
+            tx_vl_sequences[port].sequence[vl] = 0;
+            rte_spinlock_unlock(&tx_vl_sequences[port].locks[vl]);
+        }
+    }
+}
+
+/**
  * Get next sequence for a VL-ID (thread-safe)
  */
 static inline uint64_t get_next_tx_sequence(uint16_t port_id, uint16_t vl_id)
@@ -479,7 +498,9 @@ void init_rx_stats(void)
         for (int vl = 0; vl <= MAX_VL_ID; vl++)
         {
             port_vl_trackers[i].vl_trackers[vl].max_seq = 0;
+            port_vl_trackers[i].vl_trackers[vl].min_seq = 0;
             port_vl_trackers[i].vl_trackers[vl].pkt_count = 0;
+            port_vl_trackers[i].vl_trackers[vl].expected_seq = 0;
             port_vl_trackers[i].vl_trackers[vl].initialized = 0;  // 0=false, 1=true
         }
     }
